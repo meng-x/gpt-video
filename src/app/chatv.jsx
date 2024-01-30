@@ -4,10 +4,19 @@ import { useId, useEffect, useRef, useState } from "react";
 import { useChat } from "ai/react";
 import useSilenceAwareRecorder from "silence-aware-recorder/react";
 import useMediaRecorder from "@wmik/use-media-recorder";
+import mergeImages from "merge-images";
 import { useLocalStorage } from "../lib/use-local-storage";
 
-const SILENCE_DURATION = 1000;
+const INTERVAL = 200;
+const IMAGE_WIDTH = 512;
+const IMAGE_QUALITY = 0.6;
+const COLUMNS = 5;
+const MAX_SCREENSHOTS = 40;
+const SILENCE_DURATION = 2000;
 const SILENT_THRESHOLD = -30;
+
+const transparentPixel =
+  "data:image/png;base64,iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/wcAAwAB/2lXzAAAACV0RVh0ZGF0ZTpjcmVhdGU9MjAyMy0xMC0xOFQxNTo0MDozMCswMDowMEfahTAAAAAldEVYdGRhdGU6bW9kaWZ5PTIwMjMtMTAtMThUMTU6NDA6MzArMDA6MDBa8cKfAAAAAElFTkSuQmCC";
 
 // A function that plays an audio from a url and reutnrs a promise that resolves when the audio ends
 function playAudio(url) {
@@ -18,44 +27,84 @@ function playAudio(url) {
   });
 }
 
-const sendPcmData = async (blob) => {
-  const websocket = new WebSocket('ws://43.138.84.42:6002');
+async function getImageDimensions(src) {
+  return new Promise((resolve, reject) => {
+    const img = new globalThis.Image();
 
-  websocket.onopen = async () => {
-    await websocket.send(JSON.stringify({"signal":"start","input_format":"audio/x-wav;codec=pcm;bit=16;rate=16000","output_format":"flv"}));
-
-    websocket.onmessage = async (event) => {
-      const start_result = JSON.parse(event.data);
-      console.log(start_result);
-
-      if (start_result["type"] === "server_ready" && start_result["content"] === "ok") {
-        // The chunk size should be determined by your application needs
-        const chunkSize = 160000; // This is just a placeholder value
-        let offset = 0;
-
-        while (offset < blob.size) {
-          const chunk = blob.slice(offset, Math.min(blob.size, offset + chunkSize));
-          // Here we convert the blob chunk to an ArrayBuffer before sending
-          const buffer = await chunk.arrayBuffer();
-          websocket.send(buffer);
-          offset += chunkSize;
-        }
-
-        // Send the end signal when done
-        await websocket.send(JSON.stringify({"signal":"end"}));
-      } else {
-        // Handle start error
-        websocket.close();
-        console.log("socked closed...");
-      }
+    img.onload = function () {
+      resolve({
+        width: this.width,
+        height: this.height,
+      });
     };
 
-    websocket.onerror = (event) => {
-      // Handle WebSocket error
-      console.error('WebSocket error:', event);
+    img.onerror = function () {
+      reject(new Error("Failed to load image."));
     };
-  };
-};
+
+    img.src = src;
+  });
+}
+
+function base64ToBlob(base64, mimeType) {
+  const byteCharacters = atob(base64.split(",")[1]);
+  const byteNumbers = new Array(byteCharacters.length);
+  for (let i = 0; i < byteCharacters.length; i++) {
+    byteNumbers[i] = byteCharacters.charCodeAt(i);
+  }
+  const byteArray = new Uint8Array(byteNumbers);
+  return new Blob([byteArray], { type: mimeType });
+}
+
+async function uploadImageToFreeImageHost(base64Image) {
+  const blob = base64ToBlob(base64Image, "image/jpeg");
+  const formData = new FormData();
+  formData.append("file", blob, "image.jpg");
+
+  const response = await fetch("https://tmpfiles.org/api/v1/upload", {
+    method: "POST",
+    body: formData,
+  });
+
+  const { data } = await response.json();
+
+  return data.url.replace("https://tmpfiles.org/", "https://tmpfiles.org/dl/");
+}
+
+async function imagesGrid({
+  base64Images,
+  columns = COLUMNS,
+  gridImageWidth = IMAGE_WIDTH,
+  quality = IMAGE_QUALITY,
+}) {
+  if (!base64Images.length) {
+    return transparentPixel;
+  }
+
+  const dimensions = await getImageDimensions(base64Images[0]);
+
+  // Calculate the aspect ratio of the first image
+  const aspectRatio = dimensions.width / dimensions.height;
+
+  const gridImageHeight = gridImageWidth / aspectRatio;
+
+  const rows = Math.ceil(base64Images.length / columns); // Number of rows
+
+  // Prepare the images for merging
+  const imagesWithCoordinates = base64Images.map((src, index) => ({
+    src,
+    x: (index % columns) * gridImageWidth,
+    y: Math.floor(index / columns) * gridImageHeight,
+  }));
+
+  // Merge images into a single base64 string
+  return await mergeImages(imagesWithCoordinates, {
+    format: "image/jpeg",
+    quality,
+    width: columns * gridImageWidth,
+    height: rows * gridImageHeight,
+  });
+}
 
 export default function Chat() {
   const id = useId();
@@ -65,11 +114,13 @@ export default function Chat() {
   const [isStarted, setIsStarted] = useState(false);
   const [phase, setPhase] = useState("not inited");
   const [transcription, setTranscription] = useState("");
+  const [imagesGridUrl, setImagesGridUrl] = useState(null);
   const [currentVolume, setCurrentVolume] = useState(-50);
   const [volumePercentage, setVolumePercentage] = useState(0);
   const [token, setToken] = useLocalStorage("ai-token", "");
   const [lang, setLang] = useLocalStorage("lang", "");
   const isBusy = useRef(false);
+  const screenshotsRef = useRef([]);
   const videoRef = useRef();
   const canvasRef = useRef();
 
@@ -128,10 +179,33 @@ export default function Chat() {
 
     setTranscription(text);
 
+    setPhase("user: uploading video captures");
+
+    // Keep only the last XXX screenshots
+    screenshotsRef.current = screenshotsRef.current.slice(-MAX_SCREENSHOTS);
+
+    const imageUrl = await imagesGrid({
+      base64Images: screenshotsRef.current,
+    });
+
+    screenshotsRef.current = [];
+
+    const uploadUrl = await uploadImageToFreeImageHost(imageUrl);
+
+    setImagesGridUrl(imageUrl);
+
     setPhase("user: processing completion");
 
     await append({
-      content: text,
+      content: [
+        text,
+        {
+          type: "image_url",
+          image_url: {
+            url: uploadUrl,
+          },
+        },
+      ],
       role: "user",
     });
   }
@@ -162,10 +236,7 @@ export default function Chat() {
 
       const blob = await response.blob();
       const url = URL.createObjectURL(blob);
-      console.log("url of audio:", url);
       await playAudio(url);
-
-      // sendPcmData(blob);
 
       audio.startRecording();
       isBusy.current = false;
@@ -179,6 +250,49 @@ export default function Chat() {
       videoRef.current.srcObject = liveStream;
     }
   }, [liveStream]);
+
+  useEffect(() => {
+    const captureFrame = () => {
+      if (video.status === "recording" && audio.isRecording) {
+        const targetWidth = IMAGE_WIDTH;
+
+        const videoNode = videoRef.current;
+        const canvasNode = canvasRef.current;
+
+        if (videoNode && canvasNode) {
+          const context = canvasNode.getContext("2d");
+          const originalWidth = videoNode.videoWidth;
+          const originalHeight = videoNode.videoHeight;
+          const aspectRatio = originalHeight / originalWidth;
+
+          // Set new width while maintaining aspect ratio
+          canvasNode.width = targetWidth;
+          canvasNode.height = targetWidth * aspectRatio;
+
+          context.drawImage(
+            videoNode,
+            0,
+            0,
+            canvasNode.width,
+            canvasNode.height
+          );
+          // Compress and convert image to JPEG format
+          const quality = 1; // Adjust the quality as needed, between 0 and 1
+          const base64Image = canvasNode.toDataURL("image/jpeg", quality);
+
+          if (base64Image !== "data:,") {
+            screenshotsRef.current.push(base64Image);
+          }
+        }
+      }
+    };
+
+    const intervalId = setInterval(captureFrame, INTERVAL);
+
+    return () => {
+      clearInterval(intervalId);
+    };
+  }, [video.status, audio.isRecording]);
 
   useEffect(() => {
     if (!audio.isRecording) {
@@ -304,6 +418,14 @@ export default function Chat() {
           <div className="space-y-2">
             <div className="font-semibold opacity-50">Transcript:</div>
             <p>{transcription || "--"}</p>
+          </div>
+          <div className="space-y-2">
+            <div className="font-semibold opacity-50">Captures:</div>
+            <img
+              className="object-contain w-full border border-gray-500"
+              alt="Grid"
+              src={imagesGridUrl || transparentPixel}
+            />
           </div>
         </div>
       </div>

@@ -1,7 +1,7 @@
 import Chat from "./chat";
 
 export const metadata = {
-  title: "GPT Video demo",
+  title: "Fake Gemini",
   description: "An experiment to reproduce the gemini staged video for real.",
 };
 
